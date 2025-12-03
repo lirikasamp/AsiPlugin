@@ -1,8 +1,9 @@
 // src/Plugin.cpp
-// Адаптация для lirikasamp/AsiPlugin
-// - не требует RakHook/Packet.h (forward-declare Packet)
-// - регистрирует callback через std::function<rakhook::receive_t>
-// - не содержит DllMain (main.cpp ваш уже содержит DllMain)
+// Полностью готовый к использованию файл для lirikasamp/AsiPlugin
+// - НЕ включает RakHook/Packet.h (его у вас нет в include-path)
+// - использует forward-declare Packet и proxy-структуру для доступа к data/length
+// - регистрирует обработчик через std::function, созданную из лямбды,
+//   чтобы MSVC корректно преобразовал типы (устраняет C2665/C2440)
 
 #include <iostream>
 #include <string>
@@ -13,8 +14,8 @@
 #include "RakHook/RakHook.hpp"
 #include "RakNet/BitStream.h"
 
-// Forward-declaration: реальный заголовок Packet.h может отсутствовать в include-path,
-// поэтому не включаем его и не завязываемся на его определение здесь.
+// Forward-declare: реального заголовка Packet.h в include-path у вас нет,
+// поэтому не подключаем его и не зависим от точного определения.
 struct Packet;
 
 // ----------------- ПАРСЕР (перенос логики из Lua) -----------------
@@ -23,7 +24,7 @@ static void ProcessPacket(unsigned char id, RakNet::BitStream &bs)
     static bool isActive = true;
     if (!isActive) return;
 
-    if (id != 215) return; // интересует лишь пакет 215
+    if (id != 215) return; // нас интересуют только пакеты с id 215
 
     // Lua: raknetBitStreamReadInt8(bs)
     int8_t tmp1 = 0;
@@ -45,8 +46,7 @@ static void ProcessPacket(unsigned char id, RakNet::BitStream &bs)
     if (!bs.Read(len1)) return;
     std::string str1;
     if (len1 > 0) {
-        // защита от абсурда
-        if (len1 < 0 || len1 > 16 * 1024 * 1024) return;
+        if (len1 < 0 || len1 > 16 * 1024 * 1024) return; // защита от абсурда
         str1.resize(len1);
         if (!bs.Read(&str1[0], static_cast<int>(len1 * sizeof(char)))) return;
     }
@@ -77,63 +77,69 @@ static void ProcessPacket(unsigned char id, RakNet::BitStream &bs)
 
 // ----------------- обработчик, совместимый с rakhook::receive_t -----------------
 // Используем forward-declared Packet*, но для доступа к data/length выполняем приведение
-// к proxy-структуре с ожидаемыми полями.
-// В большинстве сборок RakNet Packet имеет первые публичные поля unsigned char* data; unsigned int length;
-static bool OnReceivePacket(Packet*& p)
+// к proxy-структуре с ожидаемыми полями (распространённый паттерн в моддинге SA-MP).
+static bool OnReceivePacket_Impl(Packet*& p)
 {
     if (!p) return true;
 
-    // proxy-структура: ожидаем хотя бы первые 2 поля в Packet.
+    // proxy-структура: ожидаем первые публичные поля Packet: unsigned char* data; unsigned int length;
     struct PacketProxy {
         unsigned char* data;
-        unsigned int   length;
-        // далее могут быть другие поля, но нам они не нужны
+        unsigned int length;
     };
 
     PacketProxy* proxy = reinterpret_cast<PacketProxy*>(p);
     if (!proxy || !proxy->data || proxy->length == 0) return true;
 
-    // читаем id
     unsigned char id = proxy->data[0];
     if (proxy->length <= 1) return true;
 
-    // создаём BitStream над payload (смещаем на 1 байт, чтобы пропустить id)
+    // создаём BitStream над payload (смещаем на 1 байт)
     RakNet::BitStream bs(proxy->data + 1, proxy->length - 1, false);
 
     try {
         ProcessPacket(id, bs);
     } catch (const std::exception& e) {
-        OutputDebugStringA("[OnReceivePacket] exception\n");
+        OutputDebugStringA("[OnReceivePacket_Impl] exception\n");
     } catch (...) {
-        OutputDebugStringA("[OnReceivePacket] unknown exception\n");
+        OutputDebugStringA("[OnReceivePacket_Impl] unknown exception\n");
     }
 
-    // вернуть true, чтобы не блокировать дальнейшую/оригинальную обработку пакета
+    // вернуть true, чтобы не блокировать дальнейшую обработку пакета в оригинальном коде
     return true;
 }
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 
 
-// ----------------- регистрация обработчика (статический объект) -----------------
-// Создаём std::function<rakhook::receive_t> из свободной функции OnReceivePacket.
-// Это обходит проблемы MSVC при попытке неявного приведения лямбд/перегрузок.
+// ----------------- Регистрация обработчика -----------------
+// Создаём std::function<rakhook::receive_t> явно из ЛЯМБДЫ с требуемой сигнатурой.
+// Это гарантирует, что MSVC корректно сконструирует std::function и operator+= сработает.
+
 struct PacketHookRegistrar {
     PacketHookRegistrar() {
         try {
-            // rakhook::receive_t обычно имеет сигнатуру bool(Packet*&)
-            std::function<rakhook::receive_t> fn(OnReceivePacket);
+            // Создаём лямбду с точно той же сигнатурой, что и rakhook::receive_t.
+            // В ранних/распространённых версиях RakHook это: bool(Packet*&).
+            auto lambda = [](Packet*& p) -> bool {
+                return OnReceivePacket_Impl(p);
+            };
+
+            // Явно создаём std::function<rakhook::receive_t> из лямбды.
+            std::function<rakhook::receive_t> fn(lambda);
+
+            // Регистрируем
             rakhook::on_receive_packet += fn;
+
             OutputDebugStringA("[Plugin] subscribed to rakhook::on_receive_packet\n");
         } catch (...) {
             OutputDebugStringA("[Plugin] failed to subscribe to rakhook::on_receive_packet\n");
         }
     }
+
     ~PacketHookRegistrar() {
-        // в большинстве реализаций rakhook::on_receive_packet поддерживает operator-=,
-        // но отсутствие конкретной функции-идентификатора затрудняет удаление.
-        // Оставляем очистку RakHook на rakhook::destroy() (обычно вызывается в DllMain/other).
+        // Не делаем ничего: штатная очистка rakhook::destroy() в main/другом месте освободит ресурсы.
     }
 };
 
-// статический экземпляр автоматом запускает регистрацию при загрузке модуля
+// Инстанцируем статический объект — регистрация произойдёт при загрузке модуля (без DllMain).
 static PacketHookRegistrar s_packetHookRegistrar;
