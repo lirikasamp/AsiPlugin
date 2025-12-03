@@ -1,30 +1,38 @@
-// plugin.cpp — заменяет шаблонный файл в AsiPlugin
-
+// Plugin.cpp — замените им ваш текущий файл в AsiPlugin
 #include <windows.h>
 #include <iostream>
 #include <string>
-#include <vector>
 
-// Подключаем RakHook / SAMP‑API хедеры — путь может отличаться
+// RakHook + RakNet (зависимости, которые уже используются в шаблоне AsiPlugin)
 #include "RakHook/RakHook.hpp"
 #include "RakNet/BitStream.h"
+#include "RakNet/Packet.h"    // <--- Packet в глобальном неймспейсе
 
-// Функция для разбора пакетов — перенесена из твоего Lua / C++‑версии
-void ProcessPacket(int id, RakNet::BitStream &bs) {
+// Если хотите вывод в лог SA-MP, вместо std::cout используйте соответствующие функции.
+// Здесь для простоты — std::cout.
+
+// Разбор пакета (ваша логика, port'нутая из Lua)
+void ProcessPacket(unsigned char id, RakNet::BitStream &bs)
+{
+    // флаг активности можно вынести наружу, если нужно
+    static bool isActive = true;
+    if (!isActive) return;
+
     if (id == 215) {
-        int8_t dummy1;
-        bs.Read(dummy1);
+        int8_t tmp1 = 0;
+        // чтение первого байта (в Lua был raknetBitStreamReadInt8(bs))
+        bs.Read(tmp1);
 
-        int16_t style;
+        int16_t style = 0;
+        int32_t types = 0;
         bs.Read(style);
-        int32_t types;
-        bs.Read(types);
+        bs.Read(types); // types не используется, но читаем для синхронизации
 
         if (style == 2) {
-            int8_t dummy2;
-            bs.Read(dummy2);
+            int8_t tmp2 = 0;
+            bs.Read(tmp2);
 
-            int32_t len1;
+            int32_t len1 = 0;
             bs.Read(len1);
             std::string str1;
             if (len1 > 0) {
@@ -32,7 +40,7 @@ void ProcessPacket(int id, RakNet::BitStream &bs) {
                 bs.Read(&str1[0], len1 * sizeof(char));
             }
 
-            int32_t len2;
+            int32_t len2 = 0;
             bs.Read(len2);
             std::string str2;
             if (len2 > 0) {
@@ -41,8 +49,10 @@ void ProcessPacket(int id, RakNet::BitStream &bs) {
             }
 
             if (!str1.empty()) {
-                if (!str2.empty()) std::cout << str1 << "\n" << str2 << std::endl;
-                else std::cout << str1 << std::endl;
+                if (!str2.empty())
+                    std::cout << str1 << std::endl << str2 << std::endl;
+                else
+                    std::cout << str1 << std::endl;
             } else if (!str2.empty()) {
                 std::cout << str2 << std::endl;
             }
@@ -50,29 +60,51 @@ void ProcessPacket(int id, RakNet::BitStream &bs) {
     }
 }
 
-// Callback RakHook
-void OnReceivePacket_Callback(RakNet::Packet *packet) {
+// Небольшая обёртка — безопасно вызывает ProcessPacket
+void OnReceivePacket_Impl(::Packet* packet)
+{
+    if (!packet) return;
+    // первый байт — id (raw packet data)
     unsigned char id = packet->data[0];
+
+    // создаём BitStream над payload (смещение на 1 байт)
+    // конструктор BitStream(void* bitData, unsigned int bitLengthInBytes, bool copy)
     RakNet::BitStream bs(packet->data + 1, packet->length - 1, false);
-    ProcessPacket(id, bs);
+
+    // вызываем разбор
+    try {
+        ProcessPacket(id, bs);
+    } catch (const std::exception& e) {
+        std::cerr << "[OnReceivePacket_Impl] exception: " << e.what() << std::endl;
+    }
 }
 
-// Entry point DLL
+// DllMain: инициализация / очистка RakHook
 BOOL WINAPI DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved)
 {
-    if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
-        // Инициализация RakHook
+    switch (ul_reason_for_call)
+    {
+    case DLL_PROCESS_ATTACH:
+        // Инициализируем RakHook (вернёт true при успехе)
         if (!rakhook::initialize()) {
-            MessageBoxA(NULL, "RakHook initialize failed", "Error", MB_OK | MB_ICONERROR);
+            MessageBoxA(NULL, "RakHook initialization failed", "AsiPlugin", MB_OK | MB_ICONERROR);
             return FALSE;
         }
-        // Регистрация callback
-        rakhook::on_receive_packet += OnReceivePacket_Callback;
 
-        MessageBoxA(NULL, "RC CEF (ASI) Activated", "Info", MB_OK);
-    }
-    else if (ul_reason_for_call == DLL_PROCESS_DETACH) {
+        // Регистрируем callback как лямбду — так гарантированно корректно преобразуется в std::function
+        rakhook::on_receive_packet += [](::Packet* p) {
+            OnReceivePacket_Impl(p);
+        };
+
+        // Информируем о старте (можно удалить)
+        OutputDebugStringA("[AsiPlugin] RC CEF (by CanVas Dev) activated\n");
+        break;
+
+    case DLL_PROCESS_DETACH:
+        // Удаляем обработчики (RakHook::destroy снимет подписки), затем освобождаем ресурсы
         rakhook::destroy();
+        OutputDebugStringA("[AsiPlugin] RC CEF detached\n");
+        break;
     }
     return TRUE;
 }
