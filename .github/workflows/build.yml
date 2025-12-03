@@ -1,0 +1,50 @@
+name: Build ASI Plugin
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      # 1️⃣ Клонируем репозиторий
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2️⃣ Кэшируем зависимости CMake (FetchContent)
+      - name: Cache CMake dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/_deps
+            C:/Users/runneradmin/AppData/Local/CMakePackages
+          key: cmake-cache-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: |
+            cmake-cache-
+
+      # 3️⃣ Устанавливаем нужную версию CMake
+      - name: Setup CMake
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: '3.24.4'
+
+      # 4️⃣ Настраиваем CMake
+      - name: Configure CMake
+        run: cmake -B build -S . -A Win32 -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+
+      # 5️⃣ Сборка проекта
+      - name: Build with CMake
+        run: cmake --build build --config Release --parallel
+
+      # 6️⃣ Загружаем ASI файл как артефакт
+      - name: Upload ASI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: asi-plugin
+          path: build/bin/Release/AsiPlugin.asi
